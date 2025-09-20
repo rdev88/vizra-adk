@@ -6,9 +6,10 @@ use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use RuntimeException;
+use Vizra\VizraADK\Contracts\VectorMemoryDriverInterface;
 use Vizra\VizraADK\Models\VectorMemory;
 
-class MeilisearchVectorDriver
+class MeilisearchVectorDriver implements VectorMemoryDriverInterface
 {
     protected string $host;
 
@@ -428,5 +429,13 @@ class MeilisearchVectorDriver
         } catch (\Exception $e) {
             return false;
         }
+    }
+
+    /**
+     * Get the driver name.
+     */
+    public function getName(): string
+    {
+        return 'meilisearch';
     }
 }

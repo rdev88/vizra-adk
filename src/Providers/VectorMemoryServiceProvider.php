@@ -9,7 +9,15 @@ use Vizra\VizraADK\Console\Commands\VectorMemorySearch;
 use Vizra\VizraADK\Console\Commands\VectorMemoryStats;
 use Vizra\VizraADK\Console\Commands\VectorMemoryStore;
 use Vizra\VizraADK\Contracts\EmbeddingProviderInterface;
+use Vizra\VizraADK\Contracts\VectorMemoryDriverInterface;
+use Vizra\VizraADK\Providers\CohereEmbeddingProvider;
+use Vizra\VizraADK\Providers\GeminiEmbeddingProvider;
+use Vizra\VizraADK\Providers\OllamaEmbeddingProvider;
+use Vizra\VizraADK\Providers\OpenAIEmbeddingProvider;
 use Vizra\VizraADK\Services\DocumentChunker;
+use Vizra\VizraADK\Services\Drivers\InMemoryVectorDriver;
+use Vizra\VizraADK\Services\Drivers\MeilisearchVectorDriver;
+use Vizra\VizraADK\Services\Drivers\PgVectorDriver;
 use Vizra\VizraADK\Services\VectorMemoryManager;
 
 class VectorMemoryServiceProvider extends ServiceProvider
@@ -46,11 +54,24 @@ class VectorMemoryServiceProvider extends ServiceProvider
             return new DocumentChunker;
         });
 
+        // Register the vector memory driver based on configuration
+        $this->app->singleton(VectorMemoryDriverInterface::class, function ($app) {
+            $driver = config('vizra-adk.vector_memory.driver', 'inmemory');
+
+            return match ($driver) {
+                'meilisearch' => new MeilisearchVectorDriver,
+                'pgvector' => new PgVectorDriver,
+                'inmemory' => new InMemoryVectorDriver,
+                default => new InMemoryVectorDriver,
+            };
+        });
+
         // Register the vector memory manager
         $this->app->singleton(VectorMemoryManager::class, function ($app) {
             return new VectorMemoryManager(
                 $app->make(EmbeddingProviderInterface::class),
-                $app->make(DocumentChunker::class)
+                $app->make(DocumentChunker::class),
+                $app->make(VectorMemoryDriverInterface::class)
             );
         });
 
@@ -115,7 +136,7 @@ class VectorMemoryServiceProvider extends ServiceProvider
         }
 
         // Validate driver
-        $supportedDrivers = ['pgvector', 'meilisearch'];
+        $supportedDrivers = ['pgvector', 'meilisearch', 'inmemory'];
         if (! in_array($driver, $supportedDrivers)) {
             throw new RuntimeException("Unsupported vector driver: {$driver}. Supported: ".implode(', ', $supportedDrivers));
         }
@@ -202,6 +223,10 @@ class VectorMemoryServiceProvider extends ServiceProvider
                 if (! $dbConfig || $dbConfig['driver'] !== 'pgsql') {
                     throw new RuntimeException("pgvector driver requires a PostgreSQL database connection. Check connection: {$connection}");
                 }
+                break;
+
+            case 'inmemory':
+                // In-memory driver has no external dependencies, always valid
                 break;
 
         }

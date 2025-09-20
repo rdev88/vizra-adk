@@ -9,9 +9,8 @@ use Illuminate\Support\Str;
 use InvalidArgumentException;
 use RuntimeException;
 use Vizra\VizraADK\Contracts\EmbeddingProviderInterface;
-use Vizra\VizraADK\Facades\Agent;
+use Vizra\VizraADK\Contracts\VectorMemoryDriverInterface;
 use Vizra\VizraADK\Models\VectorMemory;
-use Vizra\VizraADK\Services\Drivers\MeilisearchVectorDriver;
 
 class VectorMemoryManager
 {
@@ -19,13 +18,13 @@ class VectorMemoryManager
 
     protected DocumentChunker $chunker;
 
-    protected string $driver;
+    protected VectorMemoryDriverInterface $vectorDriver;
 
-    public function __construct(EmbeddingProviderInterface $embeddingProvider, DocumentChunker $chunker)
+    public function __construct(EmbeddingProviderInterface $embeddingProvider, DocumentChunker $chunker, ?VectorMemoryDriverInterface $vectorDriver = null)
     {
         $this->embeddingProvider = $embeddingProvider;
         $this->chunker = $chunker;
-        $this->driver = config('vizra-adk.vector_memory.driver', 'pgvector');
+        $this->vectorDriver = $vectorDriver ?? app(VectorMemoryDriverInterface::class);
     }
 
     /**
@@ -40,7 +39,7 @@ class VectorMemoryManager
     {
         // Extract agent name from class
         $agentName = $this->getAgentName($agentClass);
-        
+
         // Parse parameters
         if (is_string($contentOrArray)) {
             $content = $contentOrArray;
@@ -57,7 +56,7 @@ class VectorMemoryManager
         } else {
             throw new InvalidArgumentException('Second parameter must be string or array');
         }
-        
+
         // Auto-generate source if not provided
         $source = $source ?: class_basename($agentClass);
         $sourceId = $sourceId ?: (string) Str::ulid();
@@ -112,7 +111,7 @@ class VectorMemoryManager
     {
         // Extract agent name from class
         $agentName = $this->getAgentName($agentClass);
-        
+
         // Parse parameters
         if (is_string($contentOrArray)) {
             $content = $contentOrArray;
@@ -131,7 +130,7 @@ class VectorMemoryManager
         } else {
             throw new InvalidArgumentException('Second parameter must be string or array');
         }
-        
+
         // Auto-generate source if not provided
         $source = $source ?: class_basename($agentClass);
         $sourceId = $sourceId ?: (string) Str::ulid();
@@ -178,23 +177,17 @@ class VectorMemoryManager
                 'embedding_provider' => $this->embeddingProvider->getProviderName(),
                 'embedding_model' => $this->embeddingProvider->getModel(),
                 'embedding_dimensions' => $this->embeddingProvider->getDimensions(),
-                'embedding_vector' => $this->driver === 'pgvector' ? null : $embedding,
+                // TODO: We should remove this, there shouldn't be any
+                // harm in storing the embedding as vector and json. 
+                'embedding_vector' => $this->vectorDriver->getName() === 'pgvector' ? null : $embedding,
                 'embedding_norm' => $norm,
                 'content_hash' => $contentHash,
                 'token_count' => VectorMemory::estimateTokenCount($content),
             ]);
 
-            // Handle driver-specific storage
-            if ($this->driver === 'pgvector' && DB::connection()->getDriverName() === 'pgsql') {
-                // For PostgreSQL with pgvector, update the vector column separately
-                DB::table('agent_vector_memories')
-                    ->where('id', $memory->id)
-                    ->update(['embedding' => '['.implode(',', $embedding).']']);
-            } elseif ($this->driver === 'meilisearch') {
-                // For Meilisearch, store in the vector database
-                $meilisearchDriver = new MeilisearchVectorDriver;
-                $meilisearchDriver->store($memory);
-            }
+            // Handle driver-specific vector storage
+            $memory->embedding_vector = $embedding;
+            $this->vectorDriver->store($memory);
 
             Log::debug('Added chunk to vector memory', [
                 'agent_name' => $agentName,
@@ -204,14 +197,13 @@ class VectorMemoryManager
             ]);
 
             return $memory;
-
         } catch (\Exception $e) {
             Log::error('Failed to add chunk to vector memory', [
                 'agent_name' => $agentName,
                 'error' => $e->getMessage(),
                 'content_length' => strlen($content),
             ]);
-            throw new RuntimeException('Failed to add content to vector memory: '.$e->getMessage());
+            throw new RuntimeException('Failed to add content to vector memory: ' . $e->getMessage());
         }
     }
 
@@ -227,7 +219,7 @@ class VectorMemoryManager
     {
         // Extract agent name from class
         $agentName = $this->getAgentName($agentClass);
-        
+
         // Parse parameters
         if (is_string($queryOrArray)) {
             $query = $queryOrArray;
@@ -255,114 +247,16 @@ class VectorMemoryManager
             $queryEmbeddings = $this->embeddingProvider->embed($query);
             $queryEmbedding = $queryEmbeddings[0];
 
-            if ($this->driver === 'pgvector' && DB::connection()->getDriverName() === 'pgsql') {
-                return $this->searchWithPgVector($agentName, $queryEmbedding, $namespace, $limit, $threshold);
-            } elseif ($this->driver === 'meilisearch') {
-                return $this->searchWithMeilisearch($agentName, $queryEmbedding, $namespace, $limit, $threshold);
-            } else {
-                return $this->searchWithCosineSimilarity($agentName, $queryEmbedding, $namespace, $limit, $threshold);
-            }
-
+            // Use the vector driver for search
+            return $this->vectorDriver->search($agentName, $queryEmbedding, $namespace, $limit, $threshold);
         } catch (\Exception $e) {
             Log::error('Vector memory search failed', [
                 'agent_name' => $agentName,
                 'error' => $e->getMessage(),
                 'query_length' => strlen($query),
             ]);
-            throw new RuntimeException('Vector memory search failed: '.$e->getMessage());
+            throw new RuntimeException('Vector memory search failed: ' . $e->getMessage());
         }
-    }
-
-    /**
-     * Search using PostgreSQL pgvector extension.
-     */
-    protected function searchWithPgVector(
-        string $agentName,
-        array $queryEmbedding,
-        string $namespace,
-        int $limit,
-        float $threshold
-    ): Collection {
-        $embeddingStr = '['.implode(',', $queryEmbedding).']';
-
-        $results = DB::select('
-            SELECT
-                id, agent_name, namespace, content, metadata, source, source_id,
-                embedding_provider, embedding_model, created_at,
-                1 - (embedding <=> ?) as similarity
-            FROM agent_vector_memories
-            WHERE agent_name = ?
-                AND namespace = ?
-                AND 1 - (embedding <=> ?) >= ?
-            ORDER BY embedding <=> ?
-            LIMIT ?
-        ', [$embeddingStr, $agentName, $namespace, $embeddingStr, $threshold, $embeddingStr, $limit]);
-
-        return collect($results)->map(function ($result) {
-            $result->metadata = json_decode($result->metadata, true);
-
-            return $result;
-        });
-    }
-
-    /**
-     * Search using in-memory cosine similarity calculation.
-     */
-    protected function searchWithCosineSimilarity(
-        string $agentName,
-        array $queryEmbedding,
-        string $namespace,
-        int $limit,
-        float $threshold
-    ): Collection {
-        $memories = VectorMemory::forAgent($agentName)
-            ->inNamespace($namespace)
-            ->get();
-
-        $results = $memories->map(function (VectorMemory $memory) use ($queryEmbedding) {
-            $similarity = $memory->cosineSimilarity($queryEmbedding);
-
-            return (object) [
-                'id' => $memory->id,
-                'agent_name' => $memory->agent_name,
-                'namespace' => $memory->namespace,
-                'content' => $memory->content,
-                'metadata' => $memory->metadata,
-                'source' => $memory->source,
-                'source_id' => $memory->source_id,
-                'embedding_provider' => $memory->embedding_provider,
-                'embedding_model' => $memory->embedding_model,
-                'created_at' => $memory->created_at,
-                'similarity' => $similarity,
-            ];
-        })
-            ->filter(fn ($result) => $result->similarity >= $threshold)
-            ->sortByDesc('similarity')
-            ->take($limit)
-            ->values();
-
-        return $results;
-    }
-
-    /**
-     * Search using Meilisearch vector database.
-     */
-    protected function searchWithMeilisearch(
-        string $agentName,
-        array $queryEmbedding,
-        string $namespace,
-        int $limit,
-        float $threshold
-    ): Collection {
-        $meilisearchDriver = new MeilisearchVectorDriver;
-
-        return $meilisearchDriver->search(
-            agentName: $agentName,
-            queryEmbedding: $queryEmbedding,
-            namespace: $namespace,
-            limit: $limit,
-            threshold: $threshold
-        );
     }
 
     /**
@@ -384,12 +278,12 @@ class VectorMemoryManager
         } else {
             $searchParams = $queryOrArray;
         }
-        
+
         $results = $this->search($agentClass, $searchParams);
 
         // Extract query from params
         $query = is_string($queryOrArray) ? $queryOrArray : ($searchParams['query'] ?? '');
-        
+
         if ($results->isEmpty()) {
             return [
                 'context' => '',
@@ -412,7 +306,7 @@ class VectorMemoryManager
             if ($includeMetadata && ! empty($result->metadata)) {
                 $metadata = is_array($result->metadata) ? $result->metadata : json_decode($result->metadata, true);
                 if (! empty($metadata)) {
-                    $content .= "\n[Metadata: ".json_encode($metadata).']';
+                    $content .= "\n[Metadata: " . json_encode($metadata) . ']';
                 }
             }
 
@@ -458,7 +352,7 @@ class VectorMemoryManager
     {
         // Extract agent name from class
         $agentName = $this->getAgentName($agentClass);
-        
+
         // Parse parameters
         if (is_null($namespaceOrArray)) {
             $namespace = 'default';
@@ -469,10 +363,12 @@ class VectorMemoryManager
         } else {
             throw new InvalidArgumentException('Second parameter must be string, array, or null');
         }
-        
+
         $count = VectorMemory::forAgent($agentName)
             ->inNamespace($namespace)
             ->delete();
+
+        $this->vectorDriver->delete($agentName, $namespace);
 
         Log::info('Deleted vector memories', [
             'agent_name' => $agentName,
@@ -495,7 +391,7 @@ class VectorMemoryManager
     {
         // Extract agent name from class
         $agentName = $this->getAgentName($agentClass);
-        
+
         // Parse parameters
         if (is_string($sourceOrArray)) {
             $source = $sourceOrArray;
@@ -506,11 +402,12 @@ class VectorMemoryManager
         } else {
             throw new InvalidArgumentException('Second parameter must be string or array');
         }
-        
+
         $count = VectorMemory::forAgent($agentName)
             ->inNamespace($namespace)
             ->fromSource($source)
             ->delete();
+        $this->vectorDriver->delete($agentName, $namespace, $source);
 
         Log::info('Deleted vector memories by source', [
             'agent_name' => $agentName,
@@ -533,7 +430,7 @@ class VectorMemoryManager
     {
         // Extract agent name from class
         $agentName = $this->getAgentName($agentClass);
-        
+
         // Parse parameters
         if (is_null($namespaceOrArray)) {
             $namespace = 'default';
@@ -544,7 +441,7 @@ class VectorMemoryManager
         } else {
             throw new InvalidArgumentException('Second parameter must be string, array, or null');
         }
-        
+
         $query = VectorMemory::forAgent($agentName)->inNamespace($namespace);
 
         return [
@@ -575,7 +472,7 @@ class VectorMemoryManager
             $agent = new $agentClass();
             return $agent->getName();
         }
-        
+
         // Fallback to extracting from class name
         $className = class_basename($agentClass);
         // Convert ChiefDinnerAgent to chief_dinner_agent
